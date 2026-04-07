@@ -30,6 +30,10 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
 HF_TOKEN     = os.getenv("HF_TOKEN")
 
+DEFAULT_BASE_URL = API_BASE_URL   
+MODEL = MODEL_NAME               
+MAX_STEPS = 6                    
+
 VALID_ACTIONS = [
     "eliminate_subquery",
     "push_predicate",
@@ -177,13 +181,12 @@ def main():
     parser.add_argument("--model",    default=MODEL,            help="OpenAI model to use")
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("❌ OPENAI_API_KEY environment variable not set.")
-        print("   export OPENAI_API_KEY=your_key_here")
+   
+    if not HF_TOKEN:
+        print("❌ HF_TOKEN environment variable not set.")
         sys.exit(1)
 
-    client   = OpenAI(api_key=api_key)
+    client = OpenAI(api_key=HF_TOKEN)
     base_url = args.base_url.rstrip("/")
 
     print(f"\n{'='*55}")
