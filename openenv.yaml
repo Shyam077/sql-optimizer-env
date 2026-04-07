@@ -1,0 +1,10 @@
+spec_version: 1
+name: sql-optimizer-env
+type: space
+
+runtime:
+  type: docker
+  dockerfile: server/Dockerfile
+
+entrypoint:
+  command: uvicorn server.app:app --host 0.0.0.0 --port 7860
