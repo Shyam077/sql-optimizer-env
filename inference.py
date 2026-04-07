@@ -25,9 +25,10 @@ import requests
 from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DEFAULT_BASE_URL = "http://localhost:8000"
-MODEL            = "gpt-4o-mini"           # cheap + fast for baseline
-MAX_STEPS        = 6
+
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
+MODEL_NAME   = os.getenv("MODEL_NAME", "gpt-4o-mini")
+HF_TOKEN     = os.getenv("HF_TOKEN")
 
 VALID_ACTIONS = [
     "eliminate_subquery",
