@@ -1,8 +1,6 @@
 """
 inference.py — SQL Query Optimizer
-Required at repo root by OpenEnv Hackathon Phase 2 validator.
-
-Prints structured [START]/[STEP]/[END] blocks to stdout as required.
+Uses validator-injected API_BASE_URL and API_KEY for LLM proxy.
 """
 
 import os
@@ -11,6 +9,7 @@ import json
 import time
 import argparse
 import requests
+from openai import OpenAI
 
 DEFAULT_BASE_URL = os.environ.get("OPENENV_BASE_URL", "http://localhost:7860")
 MAX_STEPS = 6
@@ -23,6 +22,69 @@ GREEDY_ORDER = [
     "remove_redundant_columns",
 ]
 
+SYSTEM_PROMPT = """You are a SQL query optimization expert agent.
+Pick ONE optimization action per step to reduce query cost.
+
+Available actions:
+- eliminate_subquery
+- push_predicate
+- add_index_hint
+- reorder_joins
+- remove_redundant_columns
+- no_op
+
+Respond with ONLY a JSON object like:
+{"optimization_type": "eliminate_subquery", "target_table": "", "hint_value": ""}"""
+
+
+def get_llm_client():
+    """Use validator-injected API_BASE_URL and API_KEY if available."""
+    api_base = os.environ.get("API_BASE_URL", None)
+    api_key  = os.environ.get("API_KEY", os.environ.get("OPENAI_API_KEY", "dummy-key"))
+    if api_base:
+        print(f"Using LLM proxy: {api_base}", flush=True)
+        return OpenAI(base_url=api_base, api_key=api_key)
+    return OpenAI(api_key=api_key)
+
+
+def ask_llm(client, obs: dict) -> dict:
+    try:
+        user_msg = f"""Step: {obs.get('step_count',0)}/{MAX_STEPS}
+Cost: {obs.get('estimated_cost')} (original: {obs.get('original_cost')})
+Applied: {obs.get('optimization_history',[])}
+Schema: {obs.get('schema_context','')}
+Query: {obs.get('current_query','')}
+Pick next action. Reply ONLY with JSON."""
+
+        response = client.chat.completions.create(
+            model=os.environ.get("MODEL_NAME", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature=0,
+            max_tokens=100,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        raw = raw.strip()
+        action = json.loads(raw)
+        valid = ["eliminate_subquery","push_predicate","add_index_hint","reorder_joins","remove_redundant_columns","no_op"]
+        if action.get("optimization_type") not in valid:
+            action["optimization_type"] = "no_op"
+        return action
+    except Exception as e:
+        print(f"  LLM error: {e} — using greedy fallback", flush=True)
+        # Greedy fallback
+        history = obs.get("optimization_history", [])
+        for opt in GREEDY_ORDER:
+            if opt not in history:
+                return {"optimization_type": opt, "target_table": "", "hint_value": ""}
+        return {"optimization_type": "no_op", "target_table": "", "hint_value": ""}
+
 
 def wait_for_server(base_url: str, retries: int = 20, delay: int = 5) -> bool:
     print(f"Waiting for server at {base_url} ...", flush=True)
@@ -31,7 +93,7 @@ def wait_for_server(base_url: str, retries: int = 20, delay: int = 5) -> bool:
             try:
                 r = requests.get(f"{base_url}{path}", timeout=8)
                 if r.status_code == 200:
-                    print(f"Server ready via {path} (attempt {i+1})", flush=True)
+                    print(f"Server ready (attempt {i+1})", flush=True)
                     return True
             except Exception:
                 pass
@@ -40,39 +102,32 @@ def wait_for_server(base_url: str, retries: int = 20, delay: int = 5) -> bool:
     return False
 
 
-def run_episode(base_url: str, task: dict) -> dict:
+def run_episode(base_url: str, task: dict, client) -> dict:
     task_id    = task["task_id"]
     difficulty = task["difficulty"]
 
-    # ── REQUIRED: [START] block ───────────────────────────────────────────────
     print(f"[START] task={task_id}", flush=True)
 
-    # Reset
     r = requests.post(f"{base_url}/reset", json={}, timeout=30)
     r.raise_for_status()
     data = r.json()
     obs  = data.get("observation", data)
 
     total_reward = 0.0
-    done         = False
-    steps        = 0
-    tried        = set()
-    applied      = []
+    done  = False
+    steps = 0
+    applied = []
 
     while not done and steps < MAX_STEPS:
-        action_type = "no_op"
-        for opt in GREEDY_ORDER:
-            if opt not in tried:
-                action_type = opt
-                tried.add(opt)
-                break
+        action = ask_llm(client, obs)
+        action_type = action.get("optimization_type", "no_op")
 
         resp = requests.post(
             f"{base_url}/step",
             json={"action": {
                 "optimization_type": action_type,
-                "target_table": "",
-                "hint_value": "",
+                "target_table": action.get("target_table", ""),
+                "hint_value":   action.get("hint_value", ""),
             }},
             timeout=30,
         )
@@ -88,10 +143,8 @@ def run_episode(base_url: str, task: dict) -> dict:
         if reward > 0:
             applied.append(action_type)
 
-        # ── REQUIRED: [STEP] block ────────────────────────────────────────────
-        print(f"[STEP] step={steps} action={action_type} reward={round(reward, 4)}", flush=True)
+        print(f"[STEP] step={steps} action={action_type} reward={round(reward,4)}", flush=True)
 
-    # Grade via /grader
     grade = requests.post(f"{base_url}/grader", json={
         "original_cost":         obs.get("original_cost", 0),
         "final_cost":            obs.get("estimated_cost", 0),
@@ -103,8 +156,7 @@ def run_episode(base_url: str, task: dict) -> dict:
     graded = grade.json()
     score  = graded.get("score", 0.0)
 
-    # ── REQUIRED: [END] block ─────────────────────────────────────────────────
-    print(f"[END] task={task_id} score={round(score, 4)} steps={steps}", flush=True)
+    print(f"[END] task={task_id} score={round(score,4)} steps={steps}", flush=True)
 
     return {
         "task_id":            task_id,
@@ -114,7 +166,6 @@ def run_episode(base_url: str, task: dict) -> dict:
         "steps":              steps,
         "cost_reduction_pct": graded.get("cost_reduction_pct", 0),
         "optimizations":      applied,
-        "breakdown":          graded.get("breakdown", {}),
     }
 
 
@@ -126,13 +177,15 @@ def main():
 
     print(f"SQL Query Optimizer - Inference", flush=True)
     print(f"Server: {base_url}", flush=True)
+    print(f"API_BASE_URL: {os.environ.get('API_BASE_URL', 'not set')}", flush=True)
 
-    # Wait for server to be healthy
     if not wait_for_server(base_url):
-        print(f"ERROR: Server not reachable at {base_url}", flush=True)
+        print("ERROR: Server not reachable", flush=True)
         sys.exit(1)
 
-    # Fetch tasks
+    # Init LLM client with validator proxy
+    client = get_llm_client()
+
     try:
         r = requests.get(f"{base_url}/tasks", timeout=15)
         r.raise_for_status()
@@ -148,33 +201,22 @@ def main():
     results = []
     for task in tasks:
         try:
-            result = run_episode(base_url, task)
+            result = run_episode(base_url, task, client)
             results.append(result)
         except Exception as e:
             task_id = task.get("task_id", "unknown")
             print(f"[START] task={task_id}", flush=True)
             print(f"[STEP] step=1 action=no_op reward=0.0", flush=True)
             print(f"[END] task={task_id} score=0.0 steps=0", flush=True)
-            results.append({
-                "task_id":    task_id,
-                "difficulty": task.get("difficulty", "unknown"),
-                "score":      0.0,
-                "error":      str(e),
-            })
+            results.append({"task_id": task_id, "difficulty": task.get("difficulty",""), "score": 0.0, "error": str(e)})
 
     avg = sum(r["score"] for r in results) / len(results) if results else 0.0
-    print(f"average_score={round(avg, 4)}", flush=True)
+    print(f"average_score={round(avg,4)}", flush=True)
 
-    # Save scores to file
     with open("inference_scores.json", "w") as f:
-        json.dump({
-            "agent":         "greedy",
-            "base_url":      base_url,
-            "average_score": round(avg, 4),
-            "tasks":         results,
-        }, f, indent=2)
+        json.dump({"agent": "llm+greedy", "average_score": round(avg,4), "tasks": results}, f, indent=2)
 
-    print("Done. Scores saved to inference_scores.json", flush=True)
+    print("Done.", flush=True)
 
 
 if __name__ == "__main__":
